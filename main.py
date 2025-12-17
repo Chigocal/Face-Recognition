@@ -173,6 +173,11 @@ class FaceAttendanceApp(ctk.CTk):
         
         self.stop_event.clear()
 
+    # --- thresholds ---
+    REGISTRATION_THRESHOLD = 0.30  # Strict: Must be very similar to be considered "already registered"
+    VERIFICATION_THRESHOLD = 0.35  # Strict: Prevents lookalikes from verifying
+    LIVENESS_EAR_THRESHOLD = 0.003 # Variance threshold for static image detection
+
     def start_camera(self, label_widget, mode):
         """Start camera with optimized settings"""
         if not self.security_check():
@@ -209,6 +214,9 @@ class FaceAttendanceApp(ctk.CTk):
                 "face_names": [],
                 "liveness_stats": {}
             }
+            
+            # Anti-Spoofing State for Attendance
+            self.attendance_state = {}  # {name: [ear_values]}
             
             # Start threads
             self.video_thread = threading.Thread(target=self.video_capture_loop, daemon=True)
@@ -306,25 +314,65 @@ class FaceAttendanceApp(ctk.CTk):
                 # --- FACE RECOGNITION (Attendance Mode) ---
                 elif mode == "attendance":
                     # Throttle recognition to prevent CPU overload, but run independently of UI
-                    if time.time() - last_process_time > 0.2:  # 5 FPS recognition is plenty
+                    if time.time() - last_process_time > 0.15:  # Slightly faster for liveness tracking
                         small = cv2.resize(frame_to_process, (0, 0), fx=0.5, fy=0.5)
                         rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                        
+                        # 1. Detection
                         locs = face_recognition.face_locations(rgb_small)
                         encs = face_recognition.face_encodings(rgb_small, locs)
                         
+                        # 2. Landmarks for Liveness
+                        landmarks_list = face_recognition.face_landmarks(rgb_small, locs)
+                        
                         found_names = []
-                        for loc, enc in zip(locs, encs):
+                        valid_names_in_frame = set()
+                        
+                        for idx, (loc, enc) in enumerate(zip(locs, encs)):
                             name = "Unknown"
                             if self.known_face_encodings:
                                 face_distances = face_recognition.face_distance(self.known_face_encodings, enc)
-                                if len(face_distances) > 0 and np.min(face_distances) <= 0.35:
-                                    idx = np.argmin(face_distances)
-                                    name = self.known_face_names[idx]
-                                    confidence = 1 - face_distances[idx]
+                                if len(face_distances) > 0 and np.min(face_distances) <= self.VERIFICATION_THRESHOLD:
+                                    best_idx = np.argmin(face_distances)
+                                    name = self.known_face_names[best_idx]
+                                    confidence = 1 - face_distances[best_idx]
                                     
-                                    # Trigger main thread action
-                                    self.after(0, lambda n=name, c=confidence: self.mark_attendance(n, c))
+                                    # --- PASSIVE LIVENESS CHECK ---
+                                    if idx < len(landmarks_list):
+                                        lm = landmarks_list[idx]
+                                        left_ear = self.get_eye_aspect_ratio(lm['left_eye'], range(6))
+                                        right_ear = self.get_eye_aspect_ratio(lm['right_eye'], range(6))
+                                        ear = (left_ear + right_ear) / 2.0
+                                        
+                                        # Use a temporary key for buffering to avoid revealing identity yet
+                                        temp_key = f"face_{best_idx}" 
+                                        
+                                        if temp_key not in self.attendance_state:
+                                            self.attendance_state[temp_key] = deque(maxlen=20)
+                                        self.attendance_state[temp_key].append(ear)
+                                        
+                                        # Check Liveness Variance
+                                        if len(self.attendance_state[temp_key]) >= 10:
+                                            ear_std = np.std(self.attendance_state[temp_key])
+                                            if ear_std > self.LIVENESS_EAR_THRESHOLD:
+                                                # verified: REVEAL NAME
+                                                name = self.known_face_names[best_idx]
+                                                self.after(0, lambda n=name, c=confidence: self.mark_attendance(n, c))
+                                            else:
+                                                # spoof: HIDE NAME, WARN USER
+                                                name = "❌ SPOOF: Liveness Failed"
+                                        else:
+                                            name = "Analyzing Liveness..."
+                                        
+                                        valid_names_in_frame.add(temp_key)
+                                    
                             found_names.append(name)
+                        
+                        # Clean up buffer for people who left the frame
+                        current_keys = list(self.attendance_state.keys())
+                        for k in current_keys:
+                            if k not in valid_names_in_frame:
+                                del self.attendance_state[k]
                         
                         # Update shared data
                         self.processed_data["face_locations"] = locs
@@ -392,7 +440,14 @@ class FaceAttendanceApp(ctk.CTk):
                             bottom *= 2
                             left *= 2
                             
-                            color = (0, 255, 136) if name != "Unknown" else (0, 0, 255)
+                            color = (0, 255, 136) # Green (Verified)
+                            if "Unknown" in name:
+                                color = (255, 255, 255) # White
+                            elif "Analyzing" in name:
+                                color = (0, 212, 255) # Blue/Cyan
+                            elif "SPOOF" in name:
+                                color = (0, 0, 255) # Red
+                            
                             cv2.rectangle(display, (left, top), (right, bottom), color, 3)
                             cv2.putText(display, name, (left, top-10), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -580,13 +635,17 @@ class FaceAttendanceApp(ctk.CTk):
                                  self.registration_captures.copy()), 
                            daemon=True).start()
 
+    # --- thresholds ---
+    REGISTRATION_THRESHOLD = 0.30  # Strict: Must be very similar to be considered "already registered"
+    VERIFICATION_THRESHOLD = 0.35  # Strict: Prevents lookalikes from verifying
+
     def _threaded_registration(self, name, user_id, frames):
         """Threaded registration processing"""
         try:
             all_encodings = []
             for frame in frames:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                encs = face_recognition.face_encodings(rgb, num_jitters=3)  # Reduced jitters
+                encs = face_recognition.face_encodings(rgb, num_jitters=3)
                 if encs:
                     all_encodings.append(encs[0])
 
@@ -594,6 +653,21 @@ class FaceAttendanceApp(ctk.CTk):
                 self.after(0, lambda: self._reg_complete(False, 
                     "Could not extract enough facial features. Please try again."))
                 return
+            
+            # Calculate average encoding for the new user
+            avg_encoding = np.mean(all_encodings, axis=0)
+
+            # Check for duplicates against existing users
+            if self.known_face_encodings:
+                face_distances = face_recognition.face_distance(self.known_face_encodings, avg_encoding)
+                min_dist_idx = np.argmin(face_distances)
+                min_dist = face_distances[min_dist_idx]
+                
+                if min_dist < self.REGISTRATION_THRESHOLD:
+                    existing_name = self.known_face_names[min_dist_idx]
+                    self.after(0, lambda: self._reg_complete(False, 
+                        f"Registration Failed: Face already registered as '{existing_name}'."))
+                    return
 
             user_data = {
                 "name": name,
@@ -627,9 +701,24 @@ class FaceAttendanceApp(ctk.CTk):
         self.capture_count = 0
         self.registration_captures = []
         
+        # Reset Inputs
+        self.entry_name.delete(0, 'end')
+        self.entry_id.delete(0, 'end')
+        
+        # Reset Liveness State
+        self.blink_detected = False
+        self.head_movement_detected = False
+        self.face_quality_score = 0
+        self.blink_counter = 0
+        self.head_positions.clear()
+        
+        # Reset UI Status Labels
+        if hasattr(self, 'blink_status') and self.blink_status.winfo_exists():
+            self.blink_status.configure(text="❌ Blink: Pending", text_color="#ff6b6b")
+            self.movement_status.configure(text="❌ Movement: Pending", text_color="#ff6b6b")
+            self.quality_status.configure(text="⚠️ Quality: Analyzing...", text_color="#ffd93d")
+
         if success:
-            self.entry_name.delete(0, 'end')
-            self.entry_id.delete(0, 'end')
             messagebox.showinfo("Success", msg)
         else:
             messagebox.showerror("Error", msg)
