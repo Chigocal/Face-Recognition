@@ -314,21 +314,17 @@ class FaceAttendanceApp(ctk.CTk):
                 # --- FACE RECOGNITION (Attendance Mode) ---
                 elif mode == "attendance":
                     # Throttle recognition to prevent CPU overload, but run independently of UI
-                    if time.time() - last_process_time > 0.15:  # Slightly faster for liveness tracking
+                    if time.time() - last_process_time > 0.2:
                         small = cv2.resize(frame_to_process, (0, 0), fx=0.5, fy=0.5)
                         rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                         
-                        # 1. Detection
+                        # Detection
                         locs = face_recognition.face_locations(rgb_small)
                         encs = face_recognition.face_encodings(rgb_small, locs)
                         
-                        # 2. Landmarks for Liveness
-                        landmarks_list = face_recognition.face_landmarks(rgb_small, locs)
-                        
                         found_names = []
-                        valid_names_in_frame = set()
                         
-                        for idx, (loc, enc) in enumerate(zip(locs, encs)):
+                        for loc, enc in zip(locs, encs):
                             name = "Unknown"
                             if self.known_face_encodings:
                                 face_distances = face_recognition.face_distance(self.known_face_encodings, enc)
@@ -337,42 +333,10 @@ class FaceAttendanceApp(ctk.CTk):
                                     name = self.known_face_names[best_idx]
                                     confidence = 1 - face_distances[best_idx]
                                     
-                                    # --- PASSIVE LIVENESS CHECK ---
-                                    if idx < len(landmarks_list):
-                                        lm = landmarks_list[idx]
-                                        left_ear = self.get_eye_aspect_ratio(lm['left_eye'], range(6))
-                                        right_ear = self.get_eye_aspect_ratio(lm['right_eye'], range(6))
-                                        ear = (left_ear + right_ear) / 2.0
-                                        
-                                        # Use a temporary key for buffering to avoid revealing identity yet
-                                        temp_key = f"face_{best_idx}" 
-                                        
-                                        if temp_key not in self.attendance_state:
-                                            self.attendance_state[temp_key] = deque(maxlen=20)
-                                        self.attendance_state[temp_key].append(ear)
-                                        
-                                        # Check Liveness Variance
-                                        if len(self.attendance_state[temp_key]) >= 10:
-                                            ear_std = np.std(self.attendance_state[temp_key])
-                                            if ear_std > self.LIVENESS_EAR_THRESHOLD:
-                                                # verified: REVEAL NAME
-                                                name = self.known_face_names[best_idx]
-                                                self.after(0, lambda n=name, c=confidence: self.mark_attendance(n, c))
-                                            else:
-                                                # spoof: HIDE NAME, WARN USER
-                                                name = "❌ SPOOF: Liveness Failed"
-                                        else:
-                                            name = "Analyzing Liveness..."
-                                        
-                                        valid_names_in_frame.add(temp_key)
+                                    # Trigger main thread action immediately
+                                    self.after(0, lambda n=name, c=confidence: self.mark_attendance(n, c))
                                     
                             found_names.append(name)
-                        
-                        # Clean up buffer for people who left the frame
-                        current_keys = list(self.attendance_state.keys())
-                        for k in current_keys:
-                            if k not in valid_names_in_frame:
-                                del self.attendance_state[k]
                         
                         # Update shared data
                         self.processed_data["face_locations"] = locs
